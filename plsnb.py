@@ -6,10 +6,9 @@ from uuid import uuid4, UUID
 
 app = FastAPI()
 
-# In-memory "database"
+# db_memory
 notes_db = []
 
-# Pydantic model for a Note
 class Note(BaseModel):
     id: UUID
     title: str
