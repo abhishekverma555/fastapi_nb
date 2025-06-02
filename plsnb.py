@@ -1,19 +1,19 @@
 from fastapi import FastAPI, Depends, HTTPException, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from uuid import UUID
+from uuid import UUID, uuid4
 from typing import List, Optional
 import redis
 import json
 from datetime import datetime
 
-from database import get_db, SessionLocal, engine
+from database import get_db, engine
 import models
 from models import Note, User as DBUser
 import schemas
-from schemas import UserCreate, UserOut
+from schemas import UserCreate, UserOut, NoteCreate
 from auth import hash_password, verify_password, create_access_token, get_current_user
-from utils import extract_note_links, extract_links
+from utils import extract_links         # ⬅ helper that returns titles inside [[ ... ]]
 
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import pipeline
@@ -30,23 +30,77 @@ app.add_middleware(
 
 summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
 
+# Create tables (only once at start-up)
 models.Base.metadata.create_all(bind=engine)
 
-redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+# Redis client
+redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+
+def safe_serialize(list_of_dicts):
+    """Convert UUID / datetime so json.dumps works."""
+    converted = []
+    for item in list_of_dicts:
+        clean = {}
+        for k, v in item.items():
+            if isinstance(v, UUID):
+                clean[k] = str(v)
+            elif isinstance(v, datetime):
+                clean[k] = v.isoformat()
+            else:
+                clean[k] = v
+        converted.append(clean)
+    return converted
+
+
+def invalidate_notes_cache(user_id: UUID):
+    redis_client.delete(f"notes_user_{user_id}")
+
+
+def upsert_stub_notes(db: Session, user_id: UUID, linked_titles: list[str]):
+    """
+    Ensure every [[Title]] mentioned has a corresponding Note row.
+    Creates empty 'stub' notes where necessary.
+    """
+    for title in linked_titles:
+        title = title.strip()
+        if not title:
+            continue
+        existing = (
+            db.query(Note)
+            .filter(Note.user_id == user_id, Note.title == title)
+            .first()
+        )
+        if existing is None:
+            stub = Note(
+                id=uuid4(),
+                title=title,
+                content="",  # empty placeholder
+                user_id=user_id,
+            )
+            db.add(stub)
+    db.commit()
+
+
+def process_links_for_note(db: Session, note: Note):
+    """Parse links in note.content and create stub notes when needed."""
+    linked_titles = extract_links(note.content)
+    if linked_titles:
+        upsert_stub_notes(db, note.user_id, linked_titles)
 
 
 @app.get("/", tags=["Root"])
-def read_root():
+def root():
     return {"message": "Welcome to zaa Notetaker API"}
-
 
 @app.post("/register", response_model=UserOut, tags=["Authentication"])
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    existing_user = db.query(DBUser).filter(DBUser.username == user.username).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Username already registered")
-    hashed_pw = hash_password(user.password)
-    db_user = DBUser(username=user.username, hashed_password=hashed_pw)
+    if db.query(DBUser).filter(DBUser.username == user.username).first():
+        raise HTTPException(400, "Username already registered")
+    db_user = DBUser(
+        username=user.username,
+        hashed_password=hash_password(user.password),
+    )
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
@@ -54,149 +108,155 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/login", tags=["Authentication"])
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(DBUser).filter(DBUser.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {
-        "message": "Login successful",
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = db.query(DBUser).filter(DBUser.username == form.username).first()
+    if not user or not verify_password(form.password, user.hashed_password):
+        raise HTTPException(401, "Invalid credentials")
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer"}
 
-
-def safe_serialize(obj):
-    """
-    Convert list of dicts with UUID and datetime fields to JSON-serializable forms,
-    ensure unicode/multiline text is preserved.
-    """
-    if isinstance(obj, list):
-        new_list = []
-        for item in obj:
-            new_item = {}
-            for k, v in item.items():
-                if isinstance(v, UUID):
-                    new_item[k] = str(v)
-                elif isinstance(v, datetime):
-                    new_item[k] = v.isoformat()
-                else:
-                    new_item[k] = v
-            new_list.append(new_item)
-        return new_list
-    return obj
-
-
+# Notes CRUD 
 @app.get("/notes", response_model=List[schemas.Note], tags=["Notes"])
-def get_notes(db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    redis_key = f"notes_user_{current_user.id}"
-    cached = redis_client.get(redis_key)
+def get_notes(
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    cache_key = f"notes_user_{current.id}"
+    cached = redis_client.get(cache_key)
     if cached:
         return json.loads(cached)
 
-    notes = db.query(Note).filter(Note.user_id == current_user.id).all()
-    result = [schemas.Note.model_validate(note).model_dump() for note in notes]
-    safe_result = safe_serialize(result)
-    # Use ensure_ascii=False to preserve unicode and newlines safely in Redis JSON string
-    redis_client.set(redis_key, json.dumps(safe_result, ensure_ascii=False), ex=60)
+    notes = db.query(Note).filter(Note.user_id == current.id).all()
+    result = [schemas.Note.model_validate(n).model_dump() for n in notes]
+    redis_client.set(cache_key, json.dumps(safe_serialize(result), ensure_ascii=False), ex=60)
     return result
 
 
 @app.post("/notes/", response_model=schemas.Note, tags=["Notes"])
-def create_note(note: schemas.NoteCreate, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    # sanitize content to string and strip any trailing spaces but keep multiline intact
-    sanitized_content = note.content if isinstance(note.content, str) else str(note.content)
-    sanitized_content = sanitized_content.strip()
-    db_note = Note(title=note.title.strip(), content=sanitized_content, user_id=current_user.id)
+def create_note(
+    note_in: NoteCreate,
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    db_note = Note(**note_in.model_dump(), user_id=current.id)
     db.add(db_note)
     db.commit()
     db.refresh(db_note)
-    redis_client.delete(f"notes_user_{current_user.id}")
+
+    # Process links (create stubs if needed)
+    process_links_for_note(db, db_note)
+
+    invalidate_notes_cache(current.id)
     return db_note
 
 
 @app.put("/notes/{note_id}", response_model=schemas.Note, tags=["Notes"])
-def update_note(note_id: UUID, updated_note: schemas.NoteCreate, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current_user.id).first()
-    if note is None:
-        raise HTTPException(status_code=404, detail="Note not found")
+def update_note(
+    note_id: UUID,
+    note_in: NoteCreate,
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current.id).first()
+    if not note:
+        raise HTTPException(404, "Note not found")
 
-    note.title = updated_note.title.strip()
-    sanitized_content = updated_note.content if isinstance(updated_note.content, str) else str(updated_note.content)
-    note.content = sanitized_content.strip()
+    note.title = note_in.title
+    note.content = note_in.content
     db.commit()
     db.refresh(note)
-    redis_client.delete(f"notes_user_{current_user.id}")
+
+    process_links_for_note(db, note)
+    invalidate_notes_cache(current.id)
     return note
 
 
 @app.delete("/notes/{note_id}", tags=["Notes"])
-def delete_note(note_id: UUID, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current_user.id).first()
-    if note is None:
-        raise HTTPException(status_code=404, detail="Note not found")
+def delete_note(
+    note_id: UUID,
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current.id).first()
+    if not note:
+        raise HTTPException(404, "Note not found")
     db.delete(note)
     db.commit()
-    redis_client.delete(f"notes_user_{current_user.id}")
+    invalidate_notes_cache(current.id)
     return {"message": "Note deleted"}
 
-
+# ─── Linked-note view (outgoing + backlinks) ──────────────────────────────
 @app.get("/notes/{note_id}/with_links", tags=["Notes"])
-def get_note_with_links(note_id: UUID, db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current_user.id).first()
+def get_note_with_links(
+    note_id: UUID,
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    note = db.query(Note).filter(Note.id == note_id, Note.user_id == current.id).first()
     if not note:
-        raise HTTPException(status_code=404, detail="Note not found")
+        raise HTTPException(404, "Note not found")
 
-    linked_titles = extract_links(note.content)
-    linked_notes = db.query(Note).filter(Note.user_id == current_user.id, Note.title.in_(linked_titles)).all()
+    # Outgoing
+    out_titles = extract_links(note.content)
+    outgoing = (
+        db.query(Note)
+        .filter(Note.user_id == current.id, Note.title.in_(out_titles))
+        .all()
+        if out_titles
+        else []
+    )
+
+    # Backlinks (who links to me?)
+    backlinks = []
+    candidates = db.query(Note).filter(Note.user_id == current.id, Note.id != note.id).all()
+    for cand in candidates:
+        if note.title in extract_links(cand.content):
+            backlinks.append(cand)
 
     return {
         "note": schemas.Note.model_validate(note),
-        "linked_notes": [schemas.Note.model_validate(n) for n in linked_notes]
+        "outgoing_links": [schemas.Note.model_validate(n) for n in outgoing],
+        "backlinks": [schemas.Note.model_validate(n) for n in backlinks],
     }
 
 
-def chunk_text(text, max_chunk_size=500):
+def chunk_text(text, max_len=500):
     import re
     sentences = re.split(r'(?<=[.!?]) +', text)
-    chunks = []
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) + 1 <= max_chunk_size:
-            current_chunk += " " + sentence if current_chunk else sentence
+    cur, out = "", []
+    for s in sentences:
+        if len(cur) + len(s) + 1 <= max_len:
+            cur += (" " if cur else "") + s
         else:
-            chunks.append(current_chunk)
-            current_chunk = sentence
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
+            out.append(cur)
+            cur = s
+    if cur:
+        out.append(cur)
+    return out
 
 
 @app.post("/summarize/", tags=["AI"])
-def summarize_note(content: Optional[str] = Body(None, embed=True), title: Optional[str] = Body(None, embed=True),
-                   db: Session = Depends(get_db), current_user: DBUser = Depends(get_current_user)):
-    if not content and not title:
-        raise HTTPException(status_code=400, detail="Either content or title must be provided.")
+def summarize(
+    content: Optional[str] = Body(None, embed=True),
+    title: Optional[str] = Body(None, embed=True),
+    db: Session = Depends(get_db),
+    current: DBUser = Depends(get_current_user),
+):
+    if not (content or title):
+        raise HTTPException(400, "Either content or title must be provided")
 
     if title:
-        note = db.query(Note).filter(Note.user_id == current_user.id, Note.title == title).first()
+        note = db.query(Note).filter(Note.user_id == current.id, Note.title == title).first()
         if not note:
-            raise HTTPException(status_code=404, detail=f"Note with title '{title}' not found.")
-        content_to_summarize = note.content
-    else:
-        content_to_summarize = content
+            raise HTTPException(404, f"No note titled '{title}'")
+        content = note.content
 
-    chunks = chunk_text(content_to_summarize, max_chunk_size=500)
-
-    summaries = []
-    for chunk in chunks:
-        try:
-            summary = summarizer(chunk, max_length=100, min_length=30, do_sample=False)
-            summaries.append(summary[0]['summary_text'])
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
-
-    combined_summary = " ".join(summaries)
-    return {"summary": combined_summary}
+    chunks = chunk_text(content, 500)
+    partial = [summarizer(c, max_length=100, min_length=30, do_sample=False)[0]["summary_text"] for c in chunks]
+    final = " ".join(partial) if len(partial) == 1 else summarizer(" ".join(partial), max_length=120, min_length=30, do_sample=False)[0]["summary_text"]
+    return {"summary": final}
 
 
